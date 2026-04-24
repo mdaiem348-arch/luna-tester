@@ -26,6 +26,18 @@ client.once('ready', async () => {
     await client.user.setUsername('Luna-Tester');
     client.user.setActivity('/panel | Free', { type: 'PLAYING' });
     
+    // AUTO-ADD OWNER FROM ENVIRONMENT VARIABLE (for free tier)
+    if (process.env.AUTO_ADD_OWNER) {
+        const ownerId = process.env.AUTO_ADD_OWNER;
+        const existing = db.prepare('SELECT * FROM whitelist WHERE discord_id = ?').get(ownerId);
+        if (!existing) {
+            db.prepare('INSERT INTO whitelist (discord_id, role) VALUES (?, ?)').run(ownerId, 'owner');
+            console.log('✅ Owner auto-added from environment variable');
+        } else {
+            console.log('✅ Owner already exists in whitelist');
+        }
+    }
+    
     const rest = new REST().setToken(process.env.DISCORD_TOKEN);
     await rest.put(Routes.applicationCommands(client.user.id), { body: [
         new SlashCommandBuilder().setName('ping').setDescription('Test the bot'),
