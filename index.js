@@ -5,38 +5,29 @@ const bcrypt = require('bcrypt');
 const express = require('express');
 
 const db = new Database('tester.db');
-const COOLDOWN_MS = 0;
+const COOLDOWN_MS = 0; // NO COOLDOWN for testers
 
 db.exec(`CREATE TABLE IF NOT EXISTS keys (key TEXT PRIMARY KEY, used INTEGER DEFAULT 0, used_by TEXT, used_at INTEGER, created_by TEXT);
 CREATE TABLE IF NOT EXISTS accounts (username TEXT PRIMARY KEY, password TEXT, hwid TEXT, discord_id TEXT, banned INTEGER DEFAULT 0, used_key TEXT, launch_count INTEGER DEFAULT 0, hwid_reset_count INTEGER DEFAULT 0, last_hwid_reset INTEGER, role_given INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS whitelist (discord_id TEXT PRIMARY KEY, role TEXT);
 CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);
-CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, message TEXT, created_at INTEGER);`);
+CREATE TABLE IF NOT EXISTS feedback (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, message TEXT, created_at INTEGER);
+CREATE TABLE IF NOT EXISTS key_blacklist (key TEXT PRIMARY KEY, reason TEXT, blacklisted_by TEXT, blacklisted_at INTEGER);`);
 
 function generateKey() { const c='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'; let k=''; for(let i=0;i<32;i++) k+=c[Math.floor(Math.random()*c.length)]; return k; }
 function hasPerm(id, role){ const r=db.prepare('SELECT role FROM whitelist WHERE discord_id=?').get(id); return r?.role==='owner'||(role==='mod'&&r?.role==='mod')||(role==='tester'&&r?.role==='tester'); }
-function canReset(acc){ return true; }
+function canReset(acc){ return true; } // NO COOLDOWN
 function getConfig(k){ return db.prepare('SELECT value FROM config WHERE key=?').get(k)?.value; }
 function setConfig(k,v){ db.prepare('INSERT OR REPLACE INTO config(key,value) VALUES(?,?)').run(k,v); }
+function isKeyBlacklisted(key){ return db.prepare('SELECT 1 FROM key_blacklist WHERE key=?').get(key); }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.DirectMessages] });
 
 client.once('ready', async () => {
     console.log('✅ Tester Bot Online');
     await client.user.setUsername('Luna-Tester');
-    client.user.setActivity('/panel | Free', { type: 'PLAYING' });
-    
-    // AUTO-ADD OWNER FROM ENVIRONMENT VARIABLE (for free tier)
-    if (process.env.AUTO_ADD_OWNER) {
-        const ownerId = process.env.AUTO_ADD_OWNER;
-        const existing = db.prepare('SELECT * FROM whitelist WHERE discord_id = ?').get(ownerId);
-        if (!existing) {
-            db.prepare('INSERT INTO whitelist (discord_id, role) VALUES (?, ?)').run(ownerId, 'owner');
-            console.log('✅ Owner auto-added from environment variable');
-        } else {
-            console.log('✅ Owner already exists in whitelist');
-        }
-    }
+    client.user.setActivity('/panel | Free Testing', { type: 'PLAYING' });
+    console.log('Tester bot is ready!');
     
     const rest = new REST().setToken(process.env.DISCORD_TOKEN);
     await rest.put(Routes.applicationCommands(client.user.id), { body: [
@@ -52,6 +43,8 @@ client.once('ready', async () => {
         new SlashCommandBuilder().setName('removetester').setDescription('Remove tester role').addUserOption(o=>o.setName('user').setDescription('User to remove').setRequired(true)),
         new SlashCommandBuilder().setName('whitelist').setDescription('Whitelist user').addUserOption(o=>o.setName('user').setDescription('User to whitelist').setRequired(true)),
         new SlashCommandBuilder().setName('blacklist').setDescription('Blacklist user').addUserOption(o=>o.setName('user').setDescription('User to blacklist').setRequired(true)).addStringOption(o=>o.setName('reason').setDescription('Reason')),
+        new SlashCommandBuilder().setName('blacklistkey').setDescription('Blacklist a key').addStringOption(o=>o.setName('key').setDescription('Key to blacklist').setRequired(true)).addStringOption(o=>o.setName('reason').setDescription('Reason')),
+        new SlashCommandBuilder().setName('unblacklistkey').setDescription('Unblacklist a key').addStringOption(o=>o.setName('key').setDescription('Key to unblacklist').setRequired(true)),
         new SlashCommandBuilder().setName('forcereset').setDescription('Force HWID reset').addUserOption(o=>o.setName('user').setDescription('User to reset').setRequired(true)),
         new SlashCommandBuilder().setName('userinfo').setDescription('User info').addStringOption(o=>o.setName('username').setDescription('Username').setRequired(true)),
         new SlashCommandBuilder().setName('addmod').setDescription('Add moderator').addUserOption(o=>o.setName('user').setDescription('User to promote').setRequired(true)),
@@ -119,6 +112,10 @@ client.on('interactionCreate', async interaction => {
         const username = options.getString('username');
         const password = options.getString('password');
         
+        if (isKeyBlacklisted(key)) {
+            await interaction.reply({ content: '❌ This key has been blacklisted.', ephemeral: true });
+            return;
+        }
         const keyRow = db.prepare('SELECT * FROM keys WHERE key=? AND used=0').get(key);
         if (!keyRow) {
             await interaction.reply({ content: '❌ Invalid or used key', ephemeral: true });
@@ -139,7 +136,9 @@ client.on('interactionCreate', async interaction => {
         const total = db.prepare('SELECT COUNT(*) c FROM keys').get().c;
         const used = db.prepare('SELECT COUNT(*) c FROM keys WHERE used=1').get().c;
         const usersCount = db.prepare('SELECT COUNT(*) c FROM accounts').get().c;
-        await interaction.reply({ content: `🧪 **Tester Stats**\nKeys: ${used}/${total}\nTesters: ${usersCount}\n⚡ NO COOLDOWN`, ephemeral: true });
+        const banned = db.prepare('SELECT COUNT(*) c FROM accounts WHERE banned=1').get().c;
+        const blacklistedKeys = db.prepare('SELECT COUNT(*) c FROM key_blacklist').get().c;
+        await interaction.reply({ content: `🧪 **Tester Statistics**\nTotal Keys: ${total}\nUsed Keys: ${used}\nTesters: ${usersCount}\nBanned: ${banned}\nBlacklisted Keys: ${blacklistedKeys}\nAvailable: ${total-used}`, ephemeral: true });
         return;
     }
     
@@ -207,6 +206,45 @@ client.on('interactionCreate', async interaction => {
         } else {
             await interaction.reply({ content: `❌ ${target.tag} has no account.`, ephemeral: true });
         }
+        return;
+    }
+    
+    if (commandName === 'blacklistkey') {
+        if (!hasPerm(user.id, 'mod')) {
+            await interaction.reply({ content: '❌ Mods only', ephemeral: true });
+            return;
+        }
+        const key = options.getString('key');
+        const reason = options.getString('reason') || 'No reason';
+        const keyExists = db.prepare('SELECT * FROM keys WHERE key=?').get(key);
+        if (!keyExists) {
+            await interaction.reply({ content: '❌ Key not found.', ephemeral: true });
+            return;
+        }
+        db.prepare('INSERT INTO key_blacklist(key, reason, blacklisted_by, blacklisted_at) VALUES(?,?,?,?)').run(key, reason, user.id, Date.now());
+        const account = db.prepare('SELECT * FROM accounts WHERE used_key=?').get(key);
+        if (account) {
+            db.prepare('UPDATE accounts SET banned=1 WHERE username=?').run(account.username);
+            const discordUser = await client.users.fetch(account.discord_id);
+            if (discordUser) await discordUser.send(`❌ Your tester key has been blacklisted.\nReason: ${reason}`);
+        }
+        await interaction.reply({ content: `✅ Tester key \`${key}\` blacklisted.`, ephemeral: true });
+        return;
+    }
+    
+    if (commandName === 'unblacklistkey') {
+        if (!hasPerm(user.id, 'mod')) {
+            await interaction.reply({ content: '❌ Mods only', ephemeral: true });
+            return;
+        }
+        const key = options.getString('key');
+        const blacklisted = db.prepare('SELECT * FROM key_blacklist WHERE key=?').get(key);
+        if (!blacklisted) {
+            await interaction.reply({ content: '❌ Key not blacklisted.', ephemeral: true });
+            return;
+        }
+        db.prepare('DELETE FROM key_blacklist WHERE key=?').run(key);
+        await interaction.reply({ content: `✅ Tester key \`${key}\` removed from blacklist.`, ephemeral: true });
         return;
     }
     
@@ -282,17 +320,25 @@ client.on('interactionCreate', async interaction => {
 
 const app = express();
 app.use(express.json());
+
 app.post('/login', (req, res) => {
     const { username, password, hwid } = req.body;
     const acc = db.prepare('SELECT * FROM accounts WHERE username=? COLLATE NOCASE').get(username);
     if (!acc) return res.json({ success: false });
     if (acc.banned) return res.json({ success: false });
+    if (isKeyBlacklisted(acc.used_key)) return res.json({ success: false });
     if (!bcrypt.compareSync(password, acc.password)) return res.json({ success: false });
     if (!acc.hwid) { db.prepare('UPDATE accounts SET hwid=?, launch_count=launch_count+1 WHERE username=?').run(hwid, username); return res.json({ success: true }); }
     if (acc.hwid !== hwid) return res.json({ success: false });
     db.prepare('UPDATE accounts SET launch_count=launch_count+1 WHERE username=?').run(username);
     res.json({ success: true });
 });
+
+// ✅ Health check endpoint for cron-job.org (keeps bot awake 24/7)
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
+
 app.listen(3003, () => console.log('🧪 Tester API on 3003'));
 
 client.login(process.env.DISCORD_TOKEN);
